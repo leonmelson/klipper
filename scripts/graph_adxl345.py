@@ -19,22 +19,36 @@ def parse_log(logname):
         out.append([float(p) for p in parts])
     return out
 
+def calc_smooth(times, data, half_smooth_samples):
+    total = 0.
+    cumdata = []
+    count = len(data)
+    for i in range(count):
+        total += data[i]
+        cumdata.append(total)
+    hss = half_smooth_samples
+    inv_ss = .5 / hss
+    sdata = [(cumdata[i+hss] - cumdata[i-hss]) * inv_ss
+             for i in range(hss, count - hss)]
+    return times[hss:-hss], sdata
+
 def plot_accel(data, logname):
+    half_smooth_samples = 15
     times = [d[0] for d in data]
-    x = [d[1] for d in data]
-    y = [d[2] for d in data]
-    z = [d[3] for d in data]
-    fig, ax1 = matplotlib.pyplot.subplots(nrows=1)
-    ax1.set_title("Accelerometer data (%s)" % (logname,))
-    ax1.set_ylabel('Accel (mm/s^2)')
-    ax1.plot(times, x, label='x', alpha=0.6)
-    ax1.plot(times, y, label='y', alpha=0.6)
-    ax1.plot(times, z, label='z', alpha=0.6)
-    fontP = matplotlib.font_manager.FontProperties()
-    fontP.set_size('x-small')
-    ax1.legend(loc='best', prop=fontP)
-    ax1.set_xlabel('Time (s)')
-    ax1.grid(True)
+    fig, axes = matplotlib.pyplot.subplots(nrows=3, sharex=True)
+    axes[0].set_title("Accelerometer data (%s)" % (logname,))
+    axis_names = ['x', 'y', 'z']
+    for i in range(len(axis_names)):
+        adata = [d[i+1] for d in data]
+        avg = sum(adata) / len(adata)
+        adata = [ad - avg for ad in adata]
+        ax = axes[i]
+        ax.plot(times, adata, alpha=0.2)
+        stimes, sdata = calc_smooth(times, adata, half_smooth_samples)
+        ax.plot(stimes, sdata, alpha=0.8)
+        ax.grid(True)
+        ax.set_ylabel('%s accel (%+.3f)\n(mm/s^2)' % (axis_names[i], -avg))
+    axes[-1].set_xlabel('Time (s)')
     fig.tight_layout()
     return fig
 
