@@ -3,8 +3,16 @@
 # Copyright (C) 2020  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, time
+import logging, time, collections
 from . import bus
+
+# ADXL345 registers
+REG_DEVID = 0x00
+REG_BW_RATE = 0x2C
+REG_DATA_FORMAT = 0x31
+REG_FIFO_CTL = 0x38
+REG_MOD_READ = 0x80
+REG_MOD_MULTI = 0x40
 
 QUERY_RATES = {
     25: 0x8, 50: 0x9, 100: 0xa, 200: 0xb, 400: 0xc,
@@ -13,20 +21,58 @@ QUERY_RATES = {
 
 SCALE = 0.004 * 9.80665 * 1000. # 4mg/LSB * Earth gravity in mm/s**2
 
-REG_DEVID = 0x00
-REG_BW_RATE = 0x2C
-REG_DATA_FORMAT = 0x31
-REG_FIFO_CTL = 0x38
-REG_MOD_READ = 0x80
-REG_MOD_MULTI = 0x40
+Accel_Measurement = collections.namedtuple(
+    'Accel_Measurement', ('time', 'accel_x', 'accel_y', 'accel_z'))
 
+# Sample results
+class ADXL345Results:
+    def __init__(self):
+        self.samples = []
+        self.drops = self.overflows = 0
+        self.time_per_sample = self.start_range = self.end_range = 0.
+    def get_samples(self):
+        return self.samples
+    def get_stats(self):
+        return ("drops=%d,overflows=%d"
+                ",time_per_sample=%.9f,start_range=%.6f,end_range=%.6f"
+                % (self.drops, self.overflows,
+                   self.time_per_sample, self.start_range, self.end_range))
+    def setup_data(self, raw_samples, end_sequence, overflows,
+                   start1_time, start2_time, end1_time, end2_time):
+        if not raw_samples or not end_sequence:
+            return
+        self.overflows = overflows
+        self.start_range = start2_time - start1_time
+        self.end_range = end2_time - end1_time
+        total_count = (end_sequence - 1) * 8 + len(raw_samples[-1][1]) // 6
+        total_time = end2_time - start2_time
+        self.time_per_sample = time_per_sample = total_time / total_count
+        seq_to_time = time_per_sample * 8.
+        self.samples = samples = [None] * total_count
+        actual_count = 0
+        for seq, data in raw_samples:
+            d = bytearray(data)
+            count = len(data)
+            sdata = [((d[j*2] | (d[j*2+1] << 8))
+                      - ((d[j*2+1] & 0x80) << 9)) * SCALE
+                     for j in range(count//2)]
+            seq_time = start2_time + seq * seq_to_time
+            for j in range(count//6):
+                samp_time = seq_time + j * time_per_sample
+                samples[actual_count] = Accel_Measurement(
+                    samp_time, sdata[j*3], sdata[j*3 + 1], sdata[j*3 + 2])
+                actual_count += 1
+        del samples[actual_count:]
+        self.drops = total_count - actual_count
+
+# Printer class that controls measurments
 class ADXL345:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.query_rate = 0
         self.last_tx_time = 0.
         # Measurement storage (accessed from background thread)
-        self.samples = []
+        self.raw_samples = []
         self.last_sequence = 0
         self.samples_start1 = self.samples_start2 = 0.
         # Setup mcu sensor_adxl345 bulk query code
@@ -67,17 +113,19 @@ class ADXL345:
         if sequence < last_sequence:
             sequence += 0x10000
         self.last_sequence = sequence
-        samples = self.samples
-        if len(samples) >= 200000:
+        raw_samples = self.raw_samples
+        if len(raw_samples) >= 200000:
             # Avoid filling up memory with too many samples
             return
-        samples.append((sequence, params['data']))
+        raw_samples.append((sequence, params['data']))
     def _convert_sequence(self, sequence):
         sequence = (self.last_sequence & ~0xffff) | sequence
         if sequence < self.last_sequence:
             sequence += 0x10000
         return sequence
-    def do_start(self, rate):
+    def start_measurements(self, rate=None):
+        if rate is None:
+            rate = 3200
         # Verify chip connectivity
         params = self.spi.spi_transfer([REG_DEVID | REG_MOD_READ, 0x00])
         response = bytearray(params['response'])
@@ -93,7 +141,7 @@ class ADXL345:
         self.spi.spi_send([REG_BW_RATE, QUERY_RATES[rate]])
         # Setup samples
         print_time = self.printer.lookup_object('toolhead').get_last_move_time()
-        self.samples = []
+        self.raw_samples = []
         self.last_sequence = 0
         self.samples_start1 = self.samples_start2 = print_time
         # Start bulk reading
@@ -103,10 +151,10 @@ class ADXL345:
         self.query_rate = rate
         self.query_adxl345_cmd.send([self.oid, reqclock, rest_ticks],
                                     reqclock=reqclock)
-    def do_end(self):
+    def finish_measurements(self):
         query_rate = self.query_rate
         if not query_rate:
-            return
+            return ADXL345Results()
         # Halt bulk reading
         print_time = self.printer.lookup_object('toolhead').get_last_move_time()
         clock = self.mcu.print_time_to_clock(print_time)
@@ -114,53 +162,41 @@ class ADXL345:
                                                  minclock=clock)
         self.last_tx_time = print_time
         self.query_rate = 0
-        samples = self.samples
-        self.samples = []
-        # Report results
+        raw_samples = self.raw_samples
+        self.raw_samples = []
+        # Generate results
         end1_time = self._clock_to_print_time(params['end1_time'])
         end2_time = self._clock_to_print_time(params['end2_time'])
         end_sequence = self._convert_sequence(params['sequence'])
-        total_count = (end_sequence - 1) * 8 + len(samples[-1][1]) // 6
-        start2_time = self.samples_start2
-        total_time = end2_time - start2_time
-        sample_to_time = total_time / total_count
-        seq_to_time = sample_to_time * 8.
+        overflows = params['limit_count']
+        res = ADXL345Results()
+        res.setup_data(raw_samples, end_sequence, overflows,
+                       self.samples_start1, self.samples_start2,
+                       end1_time, end2_time)
+        return res
+    def end_query(self):
+        if not self.query_rate:
+            return
+        res = self.finish_measurements()
+        # Write data to file
         fname = "/tmp/adxl345-%s.csv" % (time.strftime("%Y%m%d_%H%M%S"),)
         f = open(fname, "w")
-        f.write("##start=%.6f/%.6f,end=%.6f/%.6f\n"
-                % (self.samples_start1, start2_time, end1_time, end2_time))
-        f.write("##limit_count=%d,end_seq=%d,time_per_sample=%.9f\n"
-                % (params['limit_count'], end_sequence, sample_to_time))
-        f.write("#time,x,y,z\n")
-        actual_count = 0
-        for i in range(len(samples)):
-            seq, data = samples[i]
-            d = bytearray(data)
-            count = len(data)
-            sdata = [((d[j*2] | (d[j*2+1] << 8))
-                      - ((d[j*2+1] & 0x80) << 9)) * SCALE
-                     for j in range(count//2)]
-            seq_time = start2_time + seq * seq_to_time
-            for j in range(count//6):
-                f.write("%.6f,%.6f,%.6f,%.6f\n"
-                        % (seq_time + j * sample_to_time,
-                           sdata[j*3], sdata[j*3 + 1], sdata[j*3 + 2]))
-                actual_count += 1
-        f.write("##count=%d/%d,drops=%d"
-                % (total_count, actual_count, total_count - actual_count))
+        f.write("##%s\n#time,accel_x,accel_y,accel_z\n" % (res.get_stats(),))
+        for t, accel_x, accel_y, accel_z in res.get_samples():
+            f.write("%.6f,%.6f,%.6f,%.6f\n" % (t, accel_x, accel_y, accel_z))
         f.close()
     cmd_ACCELEROMETER_MEASURE_help = "Start/stop accelerometer"
     def cmd_ACCELEROMETER_MEASURE(self, gcmd):
         rate = gcmd.get_int("RATE", 0)
         if not rate:
-            self.do_end()
+            self.end_query()
             gcmd.respond_info("adxl345 measurements stopped")
         elif self.query_rate:
             raise gcmd.error("adxl345 already running")
         elif rate not in QUERY_RATES:
             raise gcmd.error("Not a valid adxl345 query rate")
         else:
-            self.do_start(rate)
+            self.start_measurements(rate)
 
 def load_config_prefix(config):
     return ADXL345(config)
