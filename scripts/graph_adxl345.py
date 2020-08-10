@@ -16,7 +16,11 @@ def parse_log(logname):
         parts = line.split(',')
         if len(parts) != 4:
             continue
-        out.append([float(p) for p in parts])
+        try:
+            fparts = [float(p) for p in parts]
+        except ValueError:
+            continue
+        out.append(fparts)
     return out
 
 def calc_smooth(times, data, half_smooth_samples):
