@@ -303,9 +303,20 @@ class ResonanceTester:
         samples = raw_values.get_samples()
         # Take the largest number of full periods
         time = math.floor(time * freq) / freq
+        # Find start of acceleration
         a2 = accel * accel
+        SLICE = 20
+        # Beginning of raw_values should have non-moving toolhead
+        avg_slice0 = self._integrate(raw_values, 0, SLICE)
+        for i in range(SLICE, len(samples)):
+            ax, ay, az = self._integrate_squared(raw_values, avg_slice0,
+                                                 i-SLICE, i)
+            # A heuristic to find the beginning of the move
+            if ax + ay + az > .125 * a2:
+                break
+        if i >= len(samples)-1:
+            raise self.gcode.error("No vibrations measured, wrong timing?")
         # Skip 'offset' time from the beginning of the toolhead move
-        i = 0
         for j in range(i+1, len(samples)):
             if samples[j].time - samples[i].time >= offset:
                 break
