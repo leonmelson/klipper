@@ -41,7 +41,10 @@ Follow the instructions in the
 [RPi Microcontroller document](RPi_microcontroller.md) to setup the
 "linux mcu" on the Raspberry Pi.
 
-Add to your printer.cfg the following:
+Make sure the Linux SPI driver is enabled by running `sudo
+raspi-config` and enabling SPI under the "Interfacing options" menu.
+
+Add the following to the printer.cfg file:
 ```
 [mcu rpi]
 serial: /tmp/klipper_host_mcu
