@@ -85,7 +85,7 @@ def main():
     if options.output is None:
         matplotlib.pyplot.show()
     else:
-        fig.set_size_inches(6, 2.5)
+        fig.set_size_inches(8, 6)
         fig.savefig(options.output)
 
 if __name__ == '__main__':
