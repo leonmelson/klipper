@@ -370,7 +370,11 @@ class QueryStatusHelper:
         self.pending_queries = []
         msglist.extend(self.clients.values())
         # Generate get_status() info for each client
-        for query_type, client, subscription, template in msglist:
+        for cconn, subscription, send_func, template in msglist:
+            is_query = cconn is None
+            if not is_query and cconn.is_closed():
+                del self.clients[cconn]
+                continue
             # Query each requested printer object
             cquery = {}
             for obj_name, req_items in subscription.items():
@@ -389,21 +393,15 @@ class QueryStatusHelper:
                 cres = {}
                 for ri in req_items:
                     rd = res.get(ri, None)
-                    if not callable(rd) and (query_type or rd != lres.get(ri)):
+                    if not callable(rd) and (is_query or rd != lres.get(ri)):
                         cres[ri] = rd
-                if cres or query_type:
+                if cres or is_query:
                     cquery[obj_name] = cres
-            # Handle one-time queries
-            if query_type:
-                client.complete((eventtime, cquery))
-                continue
-            # Otherwise send status update message
-            if client.is_closed():
-                del self.clients[client]
-            elif cquery:
+            # Send data
+            if cquery or is_query:
                 tmp = dict(template)
                 tmp['params'] = {'eventtime': eventtime, 'status': cquery}
-                client.send(tmp)
+                send_func(tmp)
         if not query:
             # Unregister timer if there are no longer any subscriptions
             reactor = self.printer.get_reactor()
@@ -411,7 +409,7 @@ class QueryStatusHelper:
             self.query_timer = None
             return reactor.NEVER
         return eventtime + SUBSCRIPTION_REFRESH_TIME
-    def _handle_query(self, web_request, query_type="query"):
+    def _handle_query(self, web_request, is_subscribe=False):
         objects = web_request.get_dict('objects')
         # Validate subscription format
         for k, v in objects.items():
@@ -422,24 +420,24 @@ class QueryStatusHelper:
                     if type(ri) != type(""):
                         raise web_request.error("Invalid argument")
         # Add to pending queries
-        reactor = self.printer.get_reactor()
-        complete = reactor.completion()
         cconn = web_request.get_client_connection()
         template = web_request.get_dict('response_template', {})
-        if query_type == "subscribe" and cconn in self.clients:
+        if is_subscribe and cconn in self.clients:
             del self.clients[cconn]
-        self.pending_queries.append((query_type, complete, objects, None))
+        reactor = self.printer.get_reactor()
+        complete = reactor.completion()
+        self.pending_queries.append((None, objects, complete.complete, {}))
         # Start timer if needed
         if self.query_timer is None:
             qt = reactor.register_timer(self._do_query, reactor.NOW)
             self.query_timer = qt
         # Wait for data to be queried
-        eventtime, cquery = complete.wait()
-        web_request.send({'eventtime': eventtime, 'status': cquery})
-        if query_type == "subscribe":
-            self.clients[cconn] = ("", cconn, objects, template)
+        msg = complete.wait()
+        web_request.send(msg['params'])
+        if is_subscribe:
+            self.clients[cconn] = (cconn, objects, cconn.send, template)
     def _handle_subscribe(self, web_request):
-        self._handle_query(web_request, query_type="subscribe")
+        self._handle_query(web_request, is_subscribe=True)
 
 def add_early_printer_objects(printer):
     printer.add_object('webhooks', WebHooks(printer))
